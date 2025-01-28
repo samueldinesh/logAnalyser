@@ -1,17 +1,19 @@
 import io
 import csv
 import re
-import logging
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_openai import OpenAI
 from langchain.prompts import PromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
+from loguru import logger
+import asyncio
 import os
+from datetime import datetime
 
-# Initialize logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Initialize Loguru logger
+logger.add("log_file.log", rotation="10 MB", level="INFO")
 
 # Load environment variables
 load_dotenv()
@@ -42,7 +44,7 @@ final_summarize_prompt = PromptTemplate.from_template(
     """
     The following are summaries of log file chunks:
     {log_content}
-    Create a concise, high-level summary focusing on recurring patterns, critical issues, and actionable insights.
+    Create a concise, high-level summary focusing on recurring patterns, critical issues, and actionable insights with detailed steps to resolve it.
     """
 )
 query_prompt = PromptTemplate.from_template(
@@ -64,28 +66,64 @@ query_chain = query_prompt | llm
 async def validate_and_read_file(file: UploadFile) -> str:
     """
     Validates the uploaded file and reads its content.
+    Args:
+        file (UploadFile): The uploaded file.
+    Returns:
+        str: The content of the file as a string.
+    Raises:
+        HTTPException: If the file type is invalid or content is empty.
     """
-    logging.info(f"Validating file: {file.filename}")
+    logger.info("Validating file: {}", file.filename)
     if file.filename.split(".")[-1] not in ["txt", "log"]:
-        logging.error("Invalid file type.")
+        logger.error("Invalid file type.")
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a .txt or .log file.")
     try:
         log_content = (await file.read()).decode("utf-8").strip()
         if not log_content:
-            logging.error("Empty or invalid file content.")
+            logger.error("Empty or invalid file content.")
             raise HTTPException(status_code=400, detail="File is empty or contains no valid content.")
         return log_content
     except Exception as e:
-        logging.error(f"Error reading file: {str(e)}")
+        logger.error("Error reading file: {}", str(e))
         raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
 
+# Utility function to split log content into manageable chunks
+def split_log_content_with_metadata(log_content: str, chunk_size=3500):
+    """
+    Splits log content into manageable chunks with metadata.
+    Args:
+        log_content (str): The full log content.
+        chunk_size (int): The maximum size of each chunk in characters.
+    Returns:
+        tuple: A list of chunks and metadata for each chunk.
+    """
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        model_name="gpt-4o",
+        chunk_size=chunk_size,
+        chunk_overlap=0,
+        separators=["\n"],
+    )
+
+    chunks = text_splitter.split_text(log_content)
+    metadata = [{"chunk_id": i, "length": len(chunk), "error_count": chunk.count("ERROR")}
+                for i, chunk in enumerate(chunks)]
+
+    logger.info("Split log into {} chunks with metadata.", len(chunks))
+    return chunks, metadata
+
+
 # Utility function to pre-summarize log content
-def regrex_logs(log_content: str, as_dict=False) -> str:
+def regex_logs(log_content: str, as_dict=False) -> str:
     """
-    Pre-summarizes the log content to extract key error details.
+    Extracts key error details from the log content using regex.
+    Args:
+        log_content (str): The full log content.
+        as_dict (bool): Whether to return the result as a dictionary.
+    Returns:
+        str or dict: A pre-summarized log content or dictionary of errors.
     """
-    logging.info("Pre-summarizing logs.")
+    logger.info("Pre-summarizing logs.")
     error_summary = {}
     lines = log_content.splitlines()
     for line in lines:
@@ -97,24 +135,65 @@ def regrex_logs(log_content: str, as_dict=False) -> str:
             error_summary[key] = error_summary.get(key, 0) + 1
 
     if as_dict:
-        return {"Error Summary": [{"Type & Description": k, "Count": v} for k, v in error_summary.items()]
-        }
+        return {"Error Summary": [{"Type & Description": k, "Count": v} for k, v in error_summary.items()]}
     return "\n".join([f"{key} - Count: {count}" for key, count in error_summary.items()])
 
-def split_log_content(log_content: str)-> str:
+def extract_metadata_with_timestamps(log_content: str):
+    """
+    Extracts metadata including error occurrence, timestamps, and time concentration.
+    Args:
+        log_content (str): The content of the log file.
+    Returns:
+        dict: Metadata about errors in the log.
+    """
+    metadata = {"total_errors": 0, "error_timestamps": {}, "time_concentration": {}}
+    lines = log_content.splitlines()
 
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        model_name="gpt-4o",
-        chunk_size=3500,
-        chunk_overlap=0,
-        separators=["\n"],
-    )
+    for line in lines:
+        timestamp_match = re.search(r"\[(.*?)\]", line)  # Extract timestamps
+        error_match = re.search(r"ERROR\s+(\d{3})?",line)#"ERROR\\s+(\\d{3})", line)
+        #"ERROR\s+(\d{3})?:?\s*(.+)"
+        #print(timestamp_match)
+        #rint(error_match)
 
-    print(len(log_content))
-    texts = text_splitter.split_text(log_content)
-    print(len(texts))
-    print(len(texts[0]))
-    return texts
+        if error_match and timestamp_match:
+            timestamp = timestamp_match.group(1)
+            error_code = error_match.group(1)
+            metadata["total_errors"] += 1
+            # Update timestamp-based metadata
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            metadata["error_timestamps"].setdefault(error_code, []).append(dt)
+
+            # Aggregate errors by hour
+            hour = dt.strftime("%Y-%m-%d %H:00:00")
+            metadata["time_concentration"][hour] = metadata["time_concentration"].get(hour, 0) + 1
+    #print (metadata)
+    return metadata
+
+# Asynchronous chunk processing
+async def process_chunk_async(chunk, chain):
+    """
+    Processes a single chunk asynchronously.
+    Args:
+        chunk (str): The chunk of log content.
+        chain: The LLM chain to process the chunk.
+    Returns:
+        str: The processed chunk summary.
+    """
+    return await asyncio.to_thread(chain.invoke, {"log_content": chunk})
+
+
+async def summarize_chunks_async(chunks, chain):
+    """
+    Processes all chunks asynchronously.
+    Args:
+        chunks (list): The list of log content chunks.
+        chain: The LLM chain to process the chunks.
+    Returns:
+        list: A list of chunk summaries.
+    """
+    tasks = [process_chunk_async(chunk, chain) for chunk in chunks]
+    return await asyncio.gather(*tasks)
 
 
 # Endpoint for basic analysis
@@ -122,66 +201,108 @@ def split_log_content(log_content: str)-> str:
 async def basic_analysis(file: UploadFile = File(...)):
     """
     Uploads a log file for basic analysis and returns a JSON response.
+    Args:
+        file (UploadFile): The uploaded log file.
+    Returns:
+        JSONResponse: The error summary.
     """
     log_content = await validate_and_read_file(file)
-    logging.info("Analyzing log file.")
-    error_summary = regrex_logs(log_content, as_dict=True)
+    logger.info("Analyzing log file.")
+    error_summary = regex_logs(log_content, as_dict=True)
+    #print(error_summary)
+    # Extract timestamp metadata
+    metadata = extract_metadata_with_timestamps(log_content)
+
+    # Format timestamp metadata for JSON response
+    time_insights = {
+        "total_errors": metadata["total_errors"],
+        "peak_time": max(metadata["time_concentration"], key=metadata["time_concentration"].get),
+        "peak_errors": max(metadata["time_concentration"].values()),
+        "time_concentration": metadata["time_concentration"]
+    }
+
     if error_summary:
-        return JSONResponse(content=error_summary)
+        return JSONResponse(content={
+            "Error Summary": error_summary["Error Summary"],
+            "Timestamp Insights": time_insights
+        })
+
+    #if error_summary:
+    #    return JSONResponse(content=error_summary)
     return {"message": "No errors found in the log file."}
 
 
 # Endpoint for summarizing logs using GenAI
-@app.post("/summarize-log/")
-async def summarize_log(file: UploadFile = File(...)):
+@app.post("/summary-raw-log/")
+async def summary_raw_log(file: UploadFile = File(...)):
     """
     Summarizes the content of a log file using GenAI.
+    Args:
+        file (UploadFile): The uploaded log file.
+    Returns:
+        dict: A dictionary containing the summarized log.
     """
-    def combine_summaries(summaries: list) -> str:
-        """
-        Combines multiple summaries into a single summary.
-        """
-        content= "\n".join(summaries)
-        try:
-            logging.info("Generating log summary with GenAI.")
-            summary = final_summarize_chain.invoke({"log_content": content})
-            print("Summary len:",len(summary))
-            return summary
-        except Exception as e:
-            logging.error(f"Error generating summary: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
-
     log_content = await validate_and_read_file(file)
-    chunks = split_log_content(log_content)
-    summaries=[]
-    for chunk in chunks[:6]:
-        try:
-            logging.info("Generating log summary with GenAI.")
-            summary = summarize_chain.invoke({"log_content": chunk})
-            print("Summary len:",len(summary))
-            summaries.append(summary)
-        except Exception as e:
-            logging.error(f"Error generating summary: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
-    result_summary = combine_summaries(summaries)
-    return {"summary": result_summary}
+    chunks, metadata = split_log_content_with_metadata(log_content)
+    summaries = await summarize_chunks_async(chunks[:10], summarize_chain)
 
+    try:
+        combined_summary = final_summarize_chain.invoke({"log_content": "\n".join(summaries)})
+        return {"summary": combined_summary}
+    except Exception as e:
+        logger.error("Error generating final summary: {}", str(e))
+        raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
+
+# Endpoint for summarizing logs using GenAI
+@app.post("/summary-log/")
+async def summary_log(file: UploadFile = File(...)):
+    """
+    Summarizes the content of a log file using GenAI.
+    Args:
+        file (UploadFile): The uploaded log file.
+    Returns:
+        dict: A dictionary containing the summarized log.
+    """
+    log_content = await validate_and_read_file(file)
+    logger.info("Analyzing log file.")
+    error_summary = regex_logs(log_content, as_dict=True)
+    print(error_summary)
+    # Extract timestamp metadata
+    metadata = extract_metadata_with_timestamps(log_content)
+
+    # Format timestamp metadata and error summary for JSON response
+    processed_error_insight= {
+        "Error Summary": error_summary["Error Summary"],
+        "Timestamp Insights": {
+        "total_errors": metadata["total_errors"],
+        "peak_time": max(metadata["time_concentration"], key=metadata["time_concentration"].get),
+        "peak_errors": max(metadata["time_concentration"].values()),
+        "time_concentration": metadata["time_concentration"]
+    }
+    }
+
+    try:
+        combined_summary = final_summarize_chain.invoke({"log_content": processed_error_insight})
+        return {"summary": combined_summary}
+    except Exception as e:
+        logger.error("Error generating final summary: {}", str(e))
+        raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
 
 # Endpoint for querying logs using GenAI
 @app.post("/query-log/")
 async def query_log(file: UploadFile = File(...), query: str = Query(..., description="Query about the log file")):
     """
     Processes a query about a log file using GenAI.
+    Args:
+        file (UploadFile): The uploaded log file.
+        query (str): The user query about the log.
+    Returns:
+        dict: The query response.
     """
     log_content = await validate_and_read_file(file)
-    pre_summary = split_log_content(log_content)
-    try:
-        logging.info("Processing query with GenAI.")
-        response = query_chain.invoke({"log_content": pre_summary, "query": query})
-        return {"query": query, "response": response}
-    except Exception as e:
-        logging.error(f"Error generating query response: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+    chunks, _ = split_log_content_with_metadata(log_content)
+    response = await summarize_chunks_async(chunks, query_chain)
+    return {"query": query, "response": "\n".join(response)}
 
 
 # Endpoint to download error summary as CSV
@@ -189,21 +310,24 @@ async def query_log(file: UploadFile = File(...), query: str = Query(..., descri
 async def download_error_summary(file: UploadFile = File(...)):
     """
     Analyzes the log file and returns the error summary as a CSV file.
+    Args:
+        file (UploadFile): The uploaded log file.
+    Returns:
+        StreamingResponse: The CSV file containing the error summary.
     """
     log_content = await validate_and_read_file(file)
-    error_summary = split_log_content(log_content)
-    if not error_summary:
-        raise HTTPException(status_code=400, detail="No errors found in the log file.")
+    error_summary, metadata = split_log_content_with_metadata(log_content)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Type & Description", "Count"])
+    writer.writerow(["Type & Description", "Count", "Chunk ID", "Chunk Length"])
 
-    for line in error_summary.split("\n"):
-        key, count = line.split(" - Count: ")
-        writer.writerow([key, count])
-    
-    #for entry in error_summary["Error Summary"]:
-    #    writer.writerow([entry["Type & Description"], entry["Count"]])
+    for entry in error_summary["Error Summary"]:
+        writer.writerow([
+            entry["Type & Description"],
+            entry["Count"],
+            metadata[entry["chunk_id"]]["length"] if "chunk_id" in entry else "N/A"
+        ])
 
     output.seek(0)
-    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=error_summary.csv"})
+    return StreamingResponse(output, media_type="text/csv",
+                             headers={"Content-Disposition": "attachment; filename=error_summary.csv"})

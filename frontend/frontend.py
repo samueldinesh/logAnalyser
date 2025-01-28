@@ -68,14 +68,16 @@ if log_content is not None:
 
                     if response.status_code == 200:
                         error_summary = response.json().get("Error Summary", [])
+                        #print(response.json())
                         st.success("Analysis completed successfully!")
                         if error_summary:
-                            st.write("### Error Summary")
-                            error_df = pd.DataFrame(error_summary)
-                            st.dataframe(error_df)
+
+                            st.write("### Error Type Analysis")
+                            error_df1 = pd.DataFrame(error_summary)
+                            st.dataframe(error_df1)
                             st.download_button(
-                                label="Download Error Summary as CSV",
-                                data=error_df.to_csv(index=False),
+                                label="Download (CSV)",
+                                data=error_df1.to_csv(index=False),
                                 file_name="error_summary.csv",
                                 mime="text/csv",
                             )
@@ -91,7 +93,7 @@ if log_content is not None:
             with st.spinner("Generating summary..."):
                 try:
                     files = {"file": ("logfile.log", log_content)}
-                    response = requests.post(f"{API_URL}/summarize-log/", files=files)
+                    response = requests.post(f"{API_URL}/summary-log/", files=files)
 
                     if response.status_code == 200:
                         summary = response.json().get("summary", "")
